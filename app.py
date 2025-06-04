@@ -1,22 +1,12 @@
 import sys
+import os
 import threading
-import asyncio
+
+import cv2
 import time
 import numpy as np
-import cv2
-import os
 from PyQt5 import QtWidgets, QtCore, QtGui, QtMultimedia
 
-from config import (
-    API_KEY, BASE_URL, WAV2LIP_MODEL_PATH, IDLE_VIDEO_PATH, FACE_IMAGE_PATH, DEVICE,
-    CHAT_FONT_SIZE,  # 左侧聊天区字体大小
-    STAGE_FONT_SIZE, # 右侧右栏状态区字体大小
-    BG_IMAGE_PATH    # 新增：窗口背景图片路径
-)
-from llm import ChatBot
-from tts import generate_speech
-from face import load_model, preprocess_image, prepare_audio_batches, LipSyncPlayer
-from asr import run_asr_thread
 
 class BubbleTextEdit(QtWidgets.QTextEdit):
     def __init__(self, *args, font_size=16, **kwargs):
@@ -25,21 +15,21 @@ class BubbleTextEdit(QtWidgets.QTextEdit):
         self.setFont(QtGui.QFont("微软雅黑", font_size))
         self.setStyleSheet(f"""
             QTextEdit {{
-                background: #191716;
-                border-radius: 20px;
+                background: #fff;
+                border-radius: 18px;
                 padding: 12px 10px 12px 10px;
                 font-size: {font_size}px;
-                color: #b27b00;
-                border: 2px solid #232323;
+                color: #222;
+                border: 1.5px solid #e2e2e2;
             }}
             QScrollBar:vertical {{
-                background: #22201e;
+                background: #f5f6fa;
                 width: 10px;
                 margin: 2px 0 2px 0;
                 border-radius: 4px;
             }}
             QScrollBar::handle:vertical {{
-                background: #a63b3b;
+                background: #e2e2e2;
                 border-radius: 5px;
                 min-height: 20px;
             }}
@@ -85,63 +75,30 @@ class BubbleTextEdit(QtWidgets.QTextEdit):
                 "</span>"
                 "</div>")
 
-class BubbleStageEdit(QtWidgets.QTextEdit):
-    def __init__(self, *args, font_size=16, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setReadOnly(True)
-        self.setFont(QtGui.QFont("微软雅黑", font_size))
-        self.setStyleSheet(f"""
-            QTextEdit {{
-                background: #191716;
-                border-radius: 20px;
-                padding: 12px 10px 12px 10px;
-                font-size: {font_size}px;
-                color: #2176ff;
-                border: 2px solid #232323;
-            }}
-            QScrollBar:vertical {{
-                background: #22201e;
-                width: 10px;
-                margin: 2px 0 2px 0;
-                border-radius: 4px;
-            }}
-            QScrollBar::handle:vertical {{
-                background: #a63b3b;
-                border-radius: 5px;
-                min-height: 20px;
-            }}
-        """)
 
-    def append_bubble(self, text, speaker="助手"):
-        self.append(
-            "<div style='margin:14px 0; text-align:left;'>"
-            "<span style=\""
-            "background: #fff;"
-            "color:#2176ff;"
-            "border-radius:32px;"
-            "border: 2.5px solid #ff3030;"
-            "box-shadow: 0 4px 18px rgba(255,48,48,0.08);"
-            "padding:14px 28px;"
-            "font-weight:600;"
-            "display:inline-block;"
-            "max-width:75%;"
-            "line-height:1.8;"
-            "word-break:break-all;"
-            "\">"
-            f"{text}"
-            "</span>"
-            "</div>")
+class MessageWindow(QtWidgets.QWidget):
+    def __init__(self, font_size=17):
+        super().__init__()
+        self.setWindowTitle("消息面板")
+        self.resize(900, 600)
+        self.setStyleSheet("background: #fff; border: none;")
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        self.left_bubble = BubbleTextEdit(font_size=font_size)
+        self.right_bubble = BubbleTextEdit(font_size=font_size)
+        self.left_bubble.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        self.right_bubble.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        layout.addWidget(self.left_bubble, 1)
+        layout.addWidget(self.right_bubble, 1)
+        self.setLayout(layout)
 
-class CardFrame(QtWidgets.QFrame):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setStyleSheet("""
-            QFrame {
-                background: rgba(34,34,34,0.92);
-                border-radius: 22px;
-                border: 1.5px solid #232323;
-            }
-        """)
+    def append_dialogue(self, text, speaker):
+        self.left_bubble.append_bubble(text, speaker)
+
+    def append_stage(self, text):
+        self.right_bubble.append_bubble(text, "助手")
+
 
 class FaceDisplayWidget(QtWidgets.QLabel):
     def __init__(self, *args, **kwargs):
@@ -150,8 +107,10 @@ class FaceDisplayWidget(QtWidgets.QLabel):
         self.setAlignment(QtCore.Qt.AlignCenter)
         self.setScaledContents(True)
 
+
 class AudioPlayer(QtCore.QObject):
     finished = QtCore.pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.player = QtMultimedia.QMediaPlayer()
@@ -169,220 +128,239 @@ class AudioPlayer(QtCore.QObject):
         if status in (QtMultimedia.QMediaPlayer.EndOfMedia, QtMultimedia.QMediaPlayer.InvalidMedia):
             self.finished.emit()
 
-class DigitalHumanUI(QtWidgets.QWidget):
-    append_history_signal = QtCore.pyqtSignal(str, str)
+
+class DigitalHumanPreview(QtWidgets.QWidget):
     show_frame_signal = QtCore.pyqtSignal(QtGui.QPixmap)
     idle_signal = QtCore.pyqtSignal()
     stage_signal = QtCore.pyqtSignal(str)
-    asr_text_signal = QtCore.pyqtSignal(str)
-    asr_status_signal = QtCore.pyqtSignal(bool, bool)
-    play_video_frames_signal = QtCore.pyqtSignal(list, str, float)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("数字人问答演示")
-        self.resize(1400, 900)
-        self.bg_pixmap = None
-        self.load_bg_pixmap()
-        # 其他状态初始化
-        self.asr_running = False
-        self.asr_thread = None
-        self._asr_wake = False
-        self.busy = False
+        self.setWindowTitle("数字人界面预览工具")
+        self.resize(1200, 800)
+        self.setStyleSheet("background: #DFDFDF;")
         self.idle_video_thread = None
         self.idle_video_running = threading.Event()
         self._last_pixmap = None
         self._last_face_size = (0, 0)
         self.audio_player = AudioPlayer()
-        self.sync_timer = QtCore.QTimer(self)
-        self.sync_timer.timeout.connect(self._sync_frame_with_audio)
         self.video_frames = []
         self.video_frame_count = 0
         self.target_fps = 25
         self.audio_total_ms = 0
+        self.current_face_image = None
+        self.current_idle_video = None
+
+        # 默认资源路径
+        self.default_face_image = "images/default_face.jpg"
+        self.default_idle_video = "videos/default_idle.mp4"
+
+        # 消息窗口
+        self.message_window = MessageWindow(font_size=17)
+        self.message_window.show()
+
         self.init_ui()
-        self.init_resources()
-        self.append_history_signal.connect(self.append_history)
+        self.show_stage("系统就绪，请选择图片和视频...")
         self.show_frame_signal.connect(self._show_pixmap_mainthread)
         self.idle_signal.connect(self.show_idle)
         self.stage_signal.connect(self.show_stage)
-        self.asr_text_signal.connect(self.on_asr_text)
-        self.asr_status_signal.connect(self.update_asr_status)
-        self.play_video_frames_signal.connect(self.play_video_frames)
-        self.show_idle()
-        self.show_stage("系统待命...")
-
-    def load_bg_pixmap(self):
-        if BG_IMAGE_PATH and os.path.exists(BG_IMAGE_PATH):
-            self.bg_pixmap = QtGui.QPixmap(BG_IMAGE_PATH)
-        else:
-            self.bg_pixmap = None
-
-    def paintEvent(self, event):
-        """自定义绘制窗口背景图片，适应缩放"""
-        super().paintEvent(event)
-        if self.bg_pixmap:
-            painter = QtGui.QPainter(self)
-            painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-            # 缩放图片以适应窗口
-            scaled_pixmap = self.bg_pixmap.scaled(self.size(), QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation)
-            # 居中
-            x = (self.width() - scaled_pixmap.width()) // 2
-            y = (self.height() - scaled_pixmap.height()) // 2
-            painter.drawPixmap(x, y, scaled_pixmap)
-            painter.end()
-
-    def resizeEvent(self, event):
-        self.update_center_panel_geometry()
-        self.update()  # 触发paintEvent以适应背景缩放
-        event.accept()
+        self.audio_player.finished.connect(self.on_audio_play_finished)
 
     def init_ui(self):
-        self.outer_layout = QtWidgets.QVBoxLayout(self)
-        self.outer_layout.setContentsMargins(0, 0, 0, 0)
-        self.outer_layout.setSpacing(0)
-        self.top_panel = QtWidgets.QWidget(self)
-        self.top_layout = QtWidgets.QHBoxLayout(self.top_panel)
-        self.top_layout.setContentsMargins(0, 0, 0, 0)
-        self.top_layout.setSpacing(0)
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(16)
 
-        self.left_panel = QtWidgets.QWidget(self.top_panel)
-        self.left_layout = QtWidgets.QVBoxLayout(self.left_panel)
-        self.left_layout.setContentsMargins(24, 24, 12, 24)
-        self.left_layout.setSpacing(18)
-        self.chat_history = BubbleTextEdit(parent=self.left_panel, font_size=CHAT_FONT_SIZE)
-        self.left_layout.addWidget(self.chat_history)
-        self.left_panel.setStyleSheet("background:transparent;")
-        self.top_layout.addWidget(self.left_panel)
+        # 资源选择区
+        resource_layout = QtWidgets.QHBoxLayout()
+        resource_layout.setSpacing(12)
 
-        self.center_panel = QtWidgets.QWidget(self.top_panel)
-        self.center_panel.setStyleSheet("background:transparent;")
+        self.face_image_btn = QtWidgets.QPushButton("选择人脸图片", self)
+        self.face_image_btn.setStyleSheet("padding:8px 16px; font-size:15px;")
+        self.face_image_btn.clicked.connect(self.select_face_image)
+
+        self.idle_video_btn = QtWidgets.QPushButton("选择待机视频", self)
+        self.idle_video_btn.setStyleSheet("padding:8px 16px; font-size:15px;")
+        self.idle_video_btn.clicked.connect(self.select_idle_video)
+
+        self.show_face_btn = QtWidgets.QPushButton("显示人脸", self)
+        self.show_face_btn.setStyleSheet("padding:8px 16px; font-size:15px;")
+        self.show_face_btn.clicked.connect(self.display_face_image)
+
+        self.play_idle_btn = QtWidgets.QPushButton("播放待机视频", self)
+        self.play_idle_btn.setStyleSheet("padding:8px 16px; font-size:15px;")
+        self.play_idle_btn.clicked.connect(self.play_idle_video_manual)
+
+        resource_layout.addWidget(self.face_image_btn)
+        resource_layout.addWidget(self.idle_video_btn)
+        resource_layout.addWidget(self.show_face_btn)
+        resource_layout.addWidget(self.play_idle_btn)
+        main_layout.addLayout(resource_layout)
+
+        # 中间人像区
+        self.center_panel = QtWidgets.QWidget(self)
+        self.center_panel.setStyleSheet("background:transparent; border: 2px dashed #ccc; border-radius: 8px;")
+        center_layout = QtWidgets.QHBoxLayout(self.center_panel)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        center_layout.addStretch(1)
         self.face_label = FaceDisplayWidget(self.center_panel)
-        self.center_layout = QtWidgets.QVBoxLayout(self.center_panel)
-        self.center_layout.setContentsMargins(0, 0, 0, 0)
-        self.center_layout.setAlignment(QtCore.Qt.AlignCenter)
-        self.center_layout.addStretch()
-        self.center_layout.addWidget(self.face_label, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter)
-        self.center_layout.addStretch()
-        self.top_layout.addWidget(self.center_panel)
+        center_layout.addWidget(self.face_label, 3)
+        center_layout.addStretch(1)
+        main_layout.addWidget(self.center_panel, stretch=10)
 
-        self.right_panel = QtWidgets.QWidget(self.top_panel)
-        self.right_layout = QtWidgets.QVBoxLayout(self.right_panel)
-        self.right_layout.setContentsMargins(12, 24, 24, 24)
-        self.right_layout.setSpacing(18)
-        self.stage_card = CardFrame(self.right_panel)
-        self.stage_label = BubbleStageEdit(self.stage_card, font_size=STAGE_FONT_SIZE)
-        self.stage_label.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
-        vbox = QtWidgets.QVBoxLayout(self.stage_card)
-        vbox.addWidget(self.stage_label)
-        vbox.setContentsMargins(10, 10, 10, 10)
-        self.right_layout.addWidget(self.stage_card)
-        self.right_panel.setStyleSheet("background:transparent;")
-        self.top_layout.addWidget(self.right_panel)
+        # 控制区
+        control_layout = QtWidgets.QHBoxLayout()
+        control_layout.setSpacing(16)
 
-        self.outer_layout.addWidget(self.top_panel, stretch=10)
+        self.simulate_btn = QtWidgets.QPushButton("模拟对话", self)
+        self.simulate_btn.setStyleSheet(
+            "padding:10px 28px; font-size:17px; background:#4faaff; color:#15181a; border-radius:10px; font-weight:bold;")
+        self.simulate_btn.clicked.connect(self.simulate_conversation)
 
-        self.input_panel = QtWidgets.QWidget(self)
-        input_layout = QtWidgets.QHBoxLayout(self.input_panel)
-        input_layout.setContentsMargins(48, 0, 48, 18)
-        input_layout.setSpacing(16)
-        self.input_box = QtWidgets.QLineEdit(self.input_panel)
-        self.input_box.setPlaceholderText("请输入你的问题或说话（支持语音唤醒）...")
-        self.input_box.setStyleSheet("""
-            font-size:17px; border-radius:12px; padding:10px; background:#181a1b;
-            border:2px solid #232323; color:#e6e6e6;
-        """)
-        self.send_btn = QtWidgets.QPushButton("发送", self.input_panel)
-        self.send_btn.setStyleSheet("""
-            font-size:17px; padding:10px 28px; background:#4faaff; color:#15181a; border-radius:10px;
-            font-weight:bold;
-        """)
-        self.send_btn.clicked.connect(self.on_submit)
-        self.asr_btn = QtWidgets.QPushButton("🎤", self.input_panel)
-        self.asr_btn.setStyleSheet("""
-            font-size:24px; padding:10px 16px; background:#232323; color:#4faaff; border-radius:50%;
-            border:2px solid #232323;
-        """)
-        self.asr_btn.setCheckable(True)
-        self.asr_btn.clicked.connect(self.on_toggle_asr)
+        self.audio_btn = QtWidgets.QPushButton("选择音频", self)
+        self.audio_btn.setStyleSheet("padding:10px 28px; font-size:17px;")
+        self.audio_btn.clicked.connect(self.select_audio)
 
-        input_layout.addWidget(self.input_box, 10)
-        input_layout.addWidget(self.send_btn, 2)
-        input_layout.addWidget(self.asr_btn, 1)
-        self.input_panel.setStyleSheet("background:transparent;")
-        self.outer_layout.addWidget(self.input_panel, stretch=0)
+        self.play_audio_btn = QtWidgets.QPushButton("播放音频", self)
+        self.play_audio_btn.setStyleSheet("padding:10px 28px; font-size:17px;")
+        self.play_audio_btn.clicked.connect(self.play_audio)
+        self.play_audio_btn.setEnabled(False)
 
-        self.asr_status_label = QtWidgets.QLabel("语音识别：关闭 | 唤醒：未唤醒", self)
-        self.asr_status_label.setStyleSheet("color:#4faaff; font-size:15px; font-weight:bold; background:transparent;")
-        self.asr_status_label.setAlignment(QtCore.Qt.AlignRight)
-        self.asr_status_label.setFixedHeight(24)
-        self.outer_layout.addWidget(self.asr_status_label, alignment=QtCore.Qt.AlignRight)
+        control_layout.addWidget(self.simulate_btn)
+        control_layout.addWidget(self.audio_btn)
+        control_layout.addWidget(self.play_audio_btn)
+        main_layout.addLayout(control_layout)
 
-        self.top_layout.setStretch(0, 1)
-        self.top_layout.setStretch(1, 1)
-        self.top_layout.setStretch(2, 1)
-        self.outer_layout.setStretch(0, 15)
-        self.outer_layout.setStretch(1, 0)
-        self.outer_layout.setStretch(2, 0)
+        # 状态显示
+        self.status_label = QtWidgets.QLabel("状态：就绪", self)
+        self.status_label.setStyleSheet("color:#4faaff; font-size:15px; font-weight:bold; background:transparent;")
+        self.status_label.setAlignment(QtCore.Qt.AlignLeft)
+        main_layout.addWidget(self.status_label)
 
-    def update_center_panel_geometry(self):
-        w = self.center_panel.width()
-        h = self.center_panel.height()
-        self.face_label.setMinimumSize(w, h)
-        self.face_label.setMaximumSize(w, h)
-        self._last_face_size = (w, h)
+        self.current_audio = None
+
+    def resizeEvent(self, event):
+        total_w = self.width()
+        total_h = self.height()
+        face_w = max(int(total_w / 3), 1)
+        face_h = min(int(total_h * 0.6), int(self.center_panel.height()))
+        if face_w < 1: face_w = 300
+        if face_h < 1: face_h = 400
+        self.face_label.setMinimumSize(face_w, face_h)
+        self.face_label.setMaximumSize(face_w, face_h)
+        self._last_face_size = (face_w, face_h)
         if self._last_pixmap is not None:
             self._show_pixmap_mainthread(self._last_pixmap)
+        event.accept()
 
-    def init_resources(self):
-        self.bot = ChatBot(
-            api_key=API_KEY,
-            base_url=BASE_URL,
-            log_dir="logs",
-            default_background="你是一个知识渊博的助手，能够简洁地回答问题。",
-            default_prefix="请简洁地回答下述问题："
+    def select_face_image(self):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择人脸图片", "", "图片文件 (*.png *.jpg *.jpeg)"
         )
-        self.model = load_model(WAV2LIP_MODEL_PATH, DEVICE)
-        self.face_img, self.face_coords, self.orig_image = preprocess_image(FACE_IMAGE_PATH, device=DEVICE)
-        self.idle_video_path = IDLE_VIDEO_PATH
-        self.lip_player = LipSyncPlayer(self.model, DEVICE, self.orig_image, self.face_coords, fps=25)
+        if file_path:
+            self.current_face_image = file_path
+            self.status_label.setText(f"状态：已选择人脸图片 - {os.path.basename(file_path)}")
+            self.show_stage(f"已选择人脸图片: {os.path.basename(file_path)}")
+
+    def select_idle_video(self):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择待机视频", "", "视频文件 (*.mp4 *.avi *.mov)"
+        )
+        if file_path:
+            self.current_idle_video = file_path
+            self.status_label.setText(f"状态：已选择待机视频 - {os.path.basename(file_path)}")
+            self.show_stage(f"已选择待机视频: {os.path.basename(file_path)}")
+
+    def select_audio(self):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择音频文件", "", "音频文件 (*.wav *.mp3 *.ogg)"
+        )
+        if file_path:
+            self.current_audio = file_path
+            self.status_label.setText(f"状态：已选择音频 - {os.path.basename(file_path)}")
+            self.play_audio_btn.setEnabled(True)
+            self.show_stage(f"已选择音频: {os.path.basename(file_path)}")
+
+    def display_face_image(self):
+        if not self.current_face_image:
+            self.show_stage("请先选择人脸图片")
+            return
+
+        self.stop_idle_video()
+        try:
+            image = cv2.imread(self.current_face_image)
+            if image is None:
+                self.show_stage(f"无法加载图片: {self.current_face_image}")
+                return
+
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            w, h = self._last_face_size
+            if w < 1 or h < 1:
+                w, h = 300, 400
+            image = cv2.resize(image, (w, h))
+            qtimg = QtGui.QImage(image.data, image.shape[1], image.shape[0], image.strides[0],
+                                 QtGui.QImage.Format_RGB888)
+            pix = QtGui.QPixmap.fromImage(qtimg)
+            self._last_pixmap = pix
+            self.show_frame_signal.emit(pix)
+            self.show_stage(f"已显示人脸图片: {os.path.basename(self.current_face_image)}")
+        except Exception as e:
+            self.show_stage(f"显示图片时出错: {str(e)}")
 
     def show_idle(self):
         self.stop_sync()
+        if not self.current_idle_video:
+            self.show_stage("请先选择待机视频")
+            return
+
         self.idle_video_running.set()
         if self.idle_video_thread is None or not self.idle_video_thread.is_alive():
             self.idle_video_thread = threading.Thread(target=self.play_idle_video, daemon=True)
             self.idle_video_thread.start()
 
     def play_idle_video(self):
+        if not self.current_idle_video:
+            return
+
         while self.idle_video_running.is_set():
-            cap = cv2.VideoCapture(self.idle_video_path)
+            cap = cv2.VideoCapture(self.current_idle_video)
             if not cap.isOpened():
-                print(f"无法打开idle视频：{self.idle_video_path}")
-                return
+                self.show_stage(f"无法打开视频: {self.current_idle_video}")
+                break
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0:
+                fps = 25
+
             while self.idle_video_running.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
+
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 w, h = self._last_face_size
-                if w < 10 or h < 10:
+                if w < 1 or h < 1:
                     w, h = 300, 400
                 frame = cv2.resize(frame, (w, h))
-                qtimg = QtGui.QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QtGui.QImage.Format_RGB888)
+                qtimg = QtGui.QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0],
+                                     QtGui.QImage.Format_RGB888)
                 pix = QtGui.QPixmap.fromImage(qtimg)
                 self._last_pixmap = pix
                 self.show_frame_signal.emit(pix)
-                time.sleep(1.0 / 25)
+                time.sleep(1.0 / fps)
+
             cap.release()
+
+    def play_idle_video_manual(self):
+        self.show_idle()
+        self.show_stage(f"正在播放待机视频: {os.path.basename(self.current_idle_video)}")
 
     def stop_idle_video(self):
         self.idle_video_running.clear()
 
     def stop_sync(self):
-        if self.sync_timer.isActive():
-            self.sync_timer.stop()
         self.video_frames = []
         self.video_frame_count = 0
         self.audio_total_ms = 0
@@ -390,183 +368,52 @@ class DigitalHumanUI(QtWidgets.QWidget):
     @QtCore.pyqtSlot(QtGui.QPixmap)
     def _show_pixmap_mainthread(self, pix):
         w, h = self._last_face_size
+        if w < 1 or h < 1:
+            w, h = 300, 400
         scaled = pix.scaled(w, h, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
         self.face_label.setPixmap(scaled)
         self._last_pixmap = pix
 
-    @QtCore.pyqtSlot(str, str)
-    def append_history(self, speaker, text):
-        self.chat_history.append_bubble(text, speaker)
-
-    @QtCore.pyqtSlot(str)
     def show_stage(self, text):
-        self.stage_label.append_bubble(text, "助手")
-        self.stage_label.verticalScrollBar().setValue(self.stage_label.verticalScrollBar().maximum())
+        self.message_window.append_stage(text)
+        self.status_label.setText(f"状态：{text}")
 
-    @QtCore.pyqtSlot(np.ndarray)
-    def show_video_frame(self, frame):
-        w, h = self._last_face_size
-        if len(frame.shape) == 2 or frame.shape[2] == 1:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-        elif frame.shape[2] == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (w, h))
-        qtimg = QtGui.QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QtGui.QImage.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qtimg)
-        self.face_label.setPixmap(pix)
-        self._last_pixmap = pix
-
-    @QtCore.pyqtSlot(list, str, float)
-    def play_video_frames(self, frames, audio_path, audio_duration):
-        self.stop_idle_video()
-        self.stop_sync()
-        self.video_frames = frames
-        self.video_frame_count = len(frames)
-        self.target_fps = 25
-        self.audio_total_ms = int(audio_duration * 1000)
-        self.audio_player.play(audio_path)
-        self.sync_timer.start(20)
-
-    def _sync_frame_with_audio(self):
-        ms = self.audio_player.player.position()
-        if ms <= 0:
-            return
-        idx = int(ms * self.target_fps / 1000)
-        idx = min(idx, self.video_frame_count - 1)
-        if 0 <= idx < self.video_frame_count:
-            frame = self.video_frames[idx]
-            self.show_video_frame(frame)
-        if ms >= self.audio_total_ms - 20 or idx >= self.video_frame_count - 1:
-            self.sync_timer.stop()
-            self.idle_signal.emit()
-
-    @QtCore.pyqtSlot(str)
-    def on_asr_text(self, text):
-        if self.busy:
-            self.stage_signal.emit("正在播报回答，请稍后再提问。")
-            return
-        text = text.strip()
-        if text:
-            self.input_box.setText(text)
-            self.on_submit()
-
-    @QtCore.pyqtSlot(bool, bool)
-    def update_asr_status(self, running, wake):
-        self.asr_running = running
-        self._asr_wake = wake
-        s = f"语音识别：{'开启' if running else '关闭'} | 唤醒：{'已唤醒' if wake else '未唤醒'}"
-        color = "#4faaff" if running else "#555"
-        wcolor = "#ff5050" if wake else "#4faaff"
-        self.asr_status_label.setText(s)
-        self.asr_status_label.setStyleSheet(f"color:{wcolor if wake else color}; font-size:15px; font-weight:bold; background:transparent;")
-        if not running:
-            self.asr_btn.setChecked(False)
-            self.asr_btn.setText("🎤")
-        else:
-            self.asr_btn.setChecked(True)
-            self.asr_btn.setText("⏹")
-
-    def on_toggle_asr(self):
-        if self.asr_running:
-            self._stop_asr()
-        else:
-            self._start_asr()
-
-    def _start_asr(self):
-        if self.asr_running:
-            return
-        self.asr_running = True
-        self.asr_btn.setText("⏹")
-        self.asr_status_signal.emit(True, False)
-        self.asr_thread = threading.Thread(target=self.start_asr, daemon=True)
-        self.asr_thread.start()
-
-    def _stop_asr(self):
-        if not self.asr_running:
-            return
-        self.asr_running = False
-        self.asr_btn.setText("🎤")
-        self.asr_status_signal.emit(False, False)
-
-    def start_asr(self):
-        def asr_callback(text, wake_state):
-            self.asr_status_signal.emit(True, wake_state)
-            if text and wake_state and not self.busy:
-                self.asr_text_signal.emit(text)
-        try:
-            run_asr_thread(asr_callback, lambda: self.asr_running)
-        except Exception as e:
-            self.asr_status_signal.emit(False, False)
-
-    def on_submit(self):
-        if self.busy:
-            self.stage_signal.emit("正在播报上一个回答，请稍后...")
-            return
-        question = self.input_box.text().strip()
-        if not question:
-            return
-        self.input_box.setText("")
-        self.append_history("用户", question)
-        self.show_stage("开始处理...")
-        self.busy = True
-        threading.Thread(target=self.process_conversation, args=(question,)).start()
-
-    def process_conversation(self, question):
-        import soundfile as sf
-        t0 = time.perf_counter()
-        self.stage_signal.emit("等待大模型回复...")
-        t1 = time.perf_counter()
-        answer = self.bot.chat(question)
-        t2 = time.perf_counter()
-        self.append_history_signal.emit("助手", answer)
-        self.stage_signal.emit(f"大模型回复完成，耗时：{t2-t1:.2f}s")
-        self.stage_signal.emit("正在合成语音...")
-
-        if not answer or len(answer.strip()) < 2:
-            self.stage_signal.emit("回答内容过短，跳过语音与口型合成。")
-            time.sleep(0.5)
-            self.idle_signal.emit()
-            self.busy = False
+    def play_audio(self):
+        if not self.current_audio:
+            self.show_stage("请先选择音频文件")
             return
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        t3 = time.perf_counter()
-        try:
-            audio_path = loop.run_until_complete(generate_speech(answer))
-        except Exception as e:
-            self.stage_signal.emit(f"语音合成失败：{e}")
-            self.idle_signal.emit()
-            self.busy = False
-            return
-        t4 = time.perf_counter()
-        if not audio_path or not os.path.exists(audio_path) or os.path.getsize(audio_path) < 800:
-            self.stage_signal.emit("语音文件生成失败或内容太短，跳过口型合成。")
-            self.idle_signal.emit()
-            self.busy = False
-            return
-        audio_info = sf.info(audio_path)
-        audio_duration = float(audio_info.duration)
-        self.stage_signal.emit(f"语音合成完成，耗时：{t4-t3:.2f}s")
-        self.stage_signal.emit("正在生成嘴型动画...")
+        self.show_stage(f"正在播放音频: {os.path.basename(self.current_audio)}")
+        self.audio_player.play(self.current_audio)
 
-        t5 = time.perf_counter()
-        gen = prepare_audio_batches(audio_path, self.face_img, self.face_coords)
-        infer_time, all_frames = self.lip_player.infer_frames(gen)
-        self.stage_signal.emit(f"视频帧推理完成，耗时{infer_time:.2f}s")
-        self.stage_signal.emit("正在播放语音与动画...")
+    def on_audio_play_finished(self):
+        self.show_stage("音频播放完成")
 
-        self.play_video_frames_signal.emit(all_frames, audio_path, audio_duration)
-        t6 = time.perf_counter()
-        self.busy = False
+    def simulate_conversation(self):
+        self.message_window.append_dialogue("这是一个模拟的用户问题", "用户")
+        self.show_stage("模拟大模型回复中...")
+
+        # 模拟回复延迟
+        QtCore.QTimer.singleShot(1500, self.show_simulated_response)
+
+    def show_simulated_response(self):
+        response = (
+            "这是一个模拟的数字人回复。在实际应用中，"
+            "这里会是大语言模型生成的回答，并通过语音合成和唇形同步技术展示。"
+            "你可以使用这个工具来测试不同图片和视频的显示效果。"
+        )
+        self.message_window.append_dialogue(response, "助手")
+        self.show_stage("模拟回复完成")
+
 
 if __name__ == "__main__":
     os.environ["QT_FONT_DPI"] = "96"
     if sys.platform == "win32":
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("digitalhuman.app")
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("digitalhuman.preview")
     sys.stdout.reconfigure(encoding='utf-8')
     app = QtWidgets.QApplication(sys.argv)
-    win = DigitalHumanUI()
+    win = DigitalHumanPreview()
     win.show()
     sys.exit(app.exec_())

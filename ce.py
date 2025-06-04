@@ -150,7 +150,7 @@ class DigitalHumanUI(QtWidgets.QWidget):
         super().__init__()
         self.setWindowTitle("数字人问答演示")
         self.resize(1200, 800)
-        self.setStyleSheet("background: #fff;")
+        self.setStyleSheet("background: #DFDFDF;")
         self.asr_running = False
         self.asr_thread = None
         self._asr_wake = False

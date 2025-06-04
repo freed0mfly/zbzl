@@ -1,13 +1,13 @@
 import cv2
 
 # 输入视频路径
-input_video_path = r"D:\coding\projects\Python\human\Wav2Lip\input\33.mp4"
+input_video_path = r"D:\coding\projects\Python\diman\Wav2Lip\input\88.mp4"
 # 输出视频路径
-output_video_path = r"D:\coding\projects\Python\human\Wav2Lip\input\44.mp4"
+output_video_path = r"D:\coding\projects\Python\diman\Wav2Lip\input\122121.mp4"
 import cv2
 
 # 保存第一帧图片的路径
-first_frame_path = r"D:\coding\projects\Python\human\Wav2Lip\input/44.png"
+first_frame_path = r"D:\coding\projects\Python\diman\Wav2Lip\input/89.png"
 
 import cv2
 

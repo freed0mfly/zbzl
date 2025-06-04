@@ -9,8 +9,8 @@ CHUNK_DURATION = 0.3
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 FORMAT = "int16"
 BUFFER_DURATION = 2.0
-wake_word = "开"
-exit_word = "关机"
+wake_word = "你好"
+exit_word = "再见"
 exit_chunks =200
 
 vad = AutoModel(
