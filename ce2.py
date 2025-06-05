@@ -489,6 +489,7 @@ class DigitalHumanUI(QtWidgets.QWidget):
 
         self.play_video_frames_signal.emit(all_frames, audio_path, audio_duration)
         t6 = time.perf_counter()
+        self.stage_signal.emit(f"播放完成，总耗时{t6-t0:.2f}s")
         self.busy = False
 
 if __name__ == "__main__":

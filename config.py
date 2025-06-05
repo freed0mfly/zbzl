@@ -7,5 +7,5 @@ FACE_IMAGE_PATH = r"D:\coding\projects\Python\diman\Wav2Lip\input\89.png"  # 驱
 DEVICE = "cuda"  # 或 "cpu"
 IDLE_VIDEO_PATH = r"D:\coding\projects\Python\diman\Wav2Lip\input\88.mp4"
 BG_IMAGE_PATH = r"D:\coding\projects\Python\diman\Wav2Lip\input\img.png"
-CHAT_FONT_SIZE = 18  # 左侧聊天区字体大小
-STAGE_FONT_SIZE = 16 # 右侧右栏状态区字体大小
+CHAT_FONT_SIZE = 12  # 左侧聊天区字体大小
+STAGE_FONT_SIZE = 12 # 右侧右栏状态区字体大小
